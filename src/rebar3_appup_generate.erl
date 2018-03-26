@@ -1085,7 +1085,9 @@ is_useless_chunk("CInf") -> true;
 
 is_useless_chunk("Abst") -> true;
 
-is_useless_chunk(_) -> false.
+is_useless_chunk("Line") -> true;
+
+is_useless_chunk(_) -> false. 
 
 %%------------------------------------------------------------------------------
 
