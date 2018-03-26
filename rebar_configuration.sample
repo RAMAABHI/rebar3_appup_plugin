@@ -1,0 +1,27 @@
+{erl_opts, [debug_info]}.
+{deps, []}.
+
+{ profile_dir, "../_build/default/"}.
+{ base_dir, "../_build"}.
+{ out_dir, "../_build/default/lib/"}.
+
+{relx, [{release, {erl_experiment, "0.1.0"}, [ erl_experiment, kernel, stdlib, sasl ]},
+
+        {dev_mode, false},
+        {include_erts, true},
+
+        {extended_start_script, true}]}.
+
+
+{ plugins, [
+
+        {rebar3_appup_plugin, {git, "https://github.com/parmar7725274/rebar3_appup_plugin.git", {branch,"develop"}} }
+]}.
+
+{post_hooks, [{"(linux|darwin|solaris)", clean, "rm -r ../_build/default/lib"}] }.
+
+{provider_hooks, [
+      {pre,  [{tar,     {appup, tar}}]},
+      {post, [{compile, {appup, compile}},
+              {clean,   {appup, clean}}]}
+]}.
