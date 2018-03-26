@@ -1182,7 +1182,7 @@ scan_beam(FD, Pos, What, Mod, Data) ->
     {_NFD, eof} when Mod =:= 17 ->
       error({missing_chunk, filename(FD), "Atom"});
     {_NFD, eof} when What =:= info ->
-      {ok, Mod, reverse(Data)};
+      {ok, Mod, lists:reverse(Data)};
     {NFD, eof} ->
       {missing, NFD, Mod, Data, What};
     {NFD, {ok, <<IdL:4/binary, Sz:32>>}} ->
@@ -1218,7 +1218,7 @@ get_data(info, Id, FD, Size, Pos, Pos2, Mod, Data)
 
 get_data(Chunks, Id, FD, Size, Pos, Pos2, Mod, Data) 
   ->
-  {NFD, NewData} = case member(Id, Chunks) of
+  {NFD, NewData} = case lists:member(Id, Chunks) of
                      true ->
                        {FD1, Chunk} = get_chunk(Id, Pos, Size, FD),
                        {FD1, [{Id, Chunk} | Data]};
@@ -1253,23 +1253,7 @@ get_atom_data(Cs, Id, FD, Size, Pos, Pos2, Data, Encoding)
 del_chunk(_Id, info) ->
   info;
 del_chunk(Id, Chunks) ->
-  delete(Id, Chunks).
-
-%%------------------------------------------------------------------------------
-%% delete(Item, List) -> List'
-%% Delete the first occurrence of Item from the list L.
-
--spec delete(Elem, List1) -> List2 when
-  Elem :: T,
-  List1 :: [T],
-  List2 :: [T],
-  T :: term().
-
-delete(Item, [Item|Rest]) -> Rest;
-
-delete(Item, [H|Rest]) ->  [H|delete(Item, Rest)];
-
-delete(_, []) -> [].
+  lists:delete(Id, Chunks).
 
 %%------------------------------------------------------------------------------
 %% -> {NFD, binary()} | throw(Error)
@@ -1328,28 +1312,12 @@ read_all(Fd, FileName, Bins) ->
       read_all(Fd, FileName, [Bin | Bins]);
     eof ->
       ok = file:close(Fd),
-      #bb{bin = uncompress(reverse(Bins)), source = FileName};
+      #bb{bin = uncompress(lists:reverse(Bins)), source = FileName};
     Error ->
       ok = file:close(Fd),
       file_error(FileName, Error)
   end.
 
-%%------------------------------------------------------------------------------
-%% reverse(L) reverse all elements in the list L. reverse/2 is now a BIF!
-
--spec reverse(List1) -> List2 when
-  List1 :: [T],
-  List2 :: [T],
-  T :: term().
-
-reverse([] = L) ->
-  L;
-reverse([_] = L) ->
-  L;
-reverse([A, B]) ->
-  [B, A];
-reverse([A, B | L]) ->
-  lists:reverse(L, [B, A]).
 
 %%------------------------------------------------------------------------------
 -spec file_error(file:filename(), {'error',atom()}) -> no_return().
@@ -1363,12 +1331,3 @@ error(Reason) ->
   throw({error, ?MODULE, Reason}).
 
 %%------------------------------------------------------------------------------
-
-%% Shadowed by erl_bif_types: lists:member/2
--spec member(Elem, List) -> boolean() when
-  Elem :: T,
-  List :: [T],
-  T :: term().
-
-member(_, _) ->
-  erlang:nif_error(undef).
