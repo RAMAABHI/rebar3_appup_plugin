@@ -21,6 +21,9 @@
 %% -------------------------------------------------------------------
 -module(rebar3_appup_generate).
 
+%% Avoid warning for local function error/1 clashing with autoimported BIF.
+-compile({no_auto_import,[error/1]}).
+
 -export([init/1,
          do/1,
          format_error/1]).
@@ -45,6 +48,20 @@
                                gen_event,
                                application,
                                supervisor]).
+
+%% Error reasons
+-type info_rsn()  :: {'chunk_too_big', file:filename(),
+                          chunkid(), ChunkSize :: non_neg_integer(),
+                          FileSize :: non_neg_integer()}
+                      | {'invalid_beam_file', file:filename(),
+                        Position :: non_neg_integer()}
+                      | {'invalid_chunk', file:filename(), chunkid()}
+                      | {'missing_chunk', file:filename(), chunkid()}
+                      | {'not_a_beam_file', file:filename()}
+                      | {'file_error', file:filename(), file:posix()}.
+
+-type chunkid()   :: nonempty_string(). % approximation of the strings below
+%% "Abst" | "Dbgi" | "Attr" | "CInf" | "ExpT" | "ImpT" | "LocT" | "Atom" | "AtU8".
 
 %% ===================================================================
 %% Public API
@@ -302,8 +319,8 @@ generate_appup_files(TargetDir,
     NewRelEbinDir = filename:join([NewVerPath, "lib",
                                 atom_to_list(App) ++ "-" ++ NewVer, "ebin"]),
 
-    {AddedFiles, DeletedFiles, ChangedFiles} = beam_lib:cmp_dirs(NewRelEbinDir,
-                                                                 OldRelEbinDir),
+    {AddedFiles, DeletedFiles, ChangedFiles} = cmp_dirs(NewRelEbinDir, OldRelEbinDir),
+  
     rebar_api:debug("beam files:", []),
     rebar_api:debug("   added: ~p", [AddedFiles]),
     rebar_api:debug("   deleted: ~p", [DeletedFiles]),
@@ -947,3 +964,406 @@ find_file_by_ext(Dir, Ext) ->
         [Path] ->
             Path
     end.
+
+%%------------------------------------------------------------------------------
+
+-spec cmp_dirs(Dir1, Dir2) ->
+  {Only1, Only2, Different} | {'error', 'beam_lib', Reason} when
+  Dir1 :: atom() | file:filename(),
+  Dir2 :: atom() | file:filename(),
+  Only1 :: [file:filename()],
+  Only2 :: [file:filename()],
+  Different :: [{Filename1 :: file:filename(), Filename2 :: file:filename()}],
+  Reason :: {'not_a_directory', term()} | info_rsn().
+
+cmp_dirs(Dir1, Dir2) ->
+  catch compare_dirs(Dir1, Dir2).
+
+%%------------------------------------------------------------------------------
+
+compare_dirs(Dir1, Dir2) ->
+  
+  R1 = sofs:relation(beam_files(Dir1)),
+  R2 = sofs:relation(beam_files(Dir2)),
+  
+  F1 = sofs:domain(R1),
+  F2 = sofs:domain(R2),
+  
+  {O1, Both, O2} = sofs:symmetric_partition(F1, F2),
+  
+  OnlyL1 = sofs:image(R1, O1),
+  OnlyL2 = sofs:image(R2, O2),
+  
+  B1 = sofs:to_external(sofs:restriction(R1, Both)),
+  B2 = sofs:to_external(sofs:restriction(R2, Both)),
+  
+  Diff = compare_files(B1, B2, []),
+  
+  {sofs:to_external(OnlyL1), sofs:to_external(OnlyL2), Diff}.
+
+%%------------------------------------------------------------------------------
+
+beam_files(Dir) ->
+  ok = assert_directory(Dir),
+  L = filelib:wildcard(filename:join(Dir, "*.beam")),
+  
+  [{filename:basename(Path), Path} || Path <- L].
+
+%%------------------------------------------------------------------------------
+
+%% -> ok | throw(Error)
+assert_directory(FileName) ->
+  case filelib:is_dir(FileName) of
+    true ->
+      ok;
+    false ->
+      error({not_a_directory, FileName})
+  end.
+
+%%------------------------------------------------------------------------------
+
+compare_files([], [], Acc) ->
+  lists:reverse(Acc);
+compare_files([{_,F1} | R1], [{_,F2} | R2], Acc) ->
+  NAcc = case catch cmp_files(F1, F2) of
+           {error, _Mod, _Reason} ->
+             [{F1, F2} | Acc];
+           ok ->
+             Acc
+         end,
+  compare_files(R1, R2, NAcc).
+
+%%------------------------------------------------------------------------------
+
+%% -> ok | throw(Error)
+cmp_files(File1, File2) ->
+  {ok, {M1, L1}} = read_all_but_useless_chunks(File1),
+  {ok, {M2, L2}} = read_all_but_useless_chunks(File2),
+  if
+    M1 =:= M2 ->
+      cmp_lists(L1, L2);
+    true ->
+      error({modules_different, M1, M2})
+  end.
+
+%%------------------------------------------------------------------------------
+
+cmp_lists([], []) ->
+  ok;
+cmp_lists([{Id, C1} | R1], [{Id, C2} | R2]) ->
+  if
+    C1 =:= C2 ->
+      cmp_lists(R1, R2);
+    true ->
+      error({chunks_different, Id})
+  end;
+cmp_lists(_, _) ->
+  error(different_chunks).
+
+%%------------------------------------------------------------------------------
+
+%% -> {ok, {Module, Chunks}} | throw(Error)
+read_all_but_useless_chunks(File0) 
+  when  is_atom(File0);
+        is_list(File0);
+        is_binary(File0) 
+  ->
+  File = beam_filename(File0),
+  
+  {ok, Module, ChunkIds0} = scan_beam(File, info),
+  
+  ChunkIds = [Name || {Name,_,_} <- ChunkIds0,
+    not is_useless_chunk(Name)],
+  
+  {ok, Module, Chunks} = scan_beam(File, ChunkIds),
+  
+  {ok, {Module, lists:reverse(Chunks)}}.
+
+%%------------------------------------------------------------------------------
+
+is_useless_chunk("CInf") -> true;
+is_useless_chunk(_) -> false.
+
+%%------------------------------------------------------------------------------
+
+beam_filename(Bin) when is_binary(Bin) ->
+  Bin;
+beam_filename(File) ->
+  filename:rootname(File, ".beam") ++ ".beam".
+
+%%------------------------------------------------------------------------------
+
+%% -> {ok, Module, Data} | throw(Error)
+scan_beam(File, What) ->
+  scan_beam(File, What, false, []).
+
+%%------------------------------------------------------------------------------
+
+%% -> {ok, Module, Data} | throw(Error)
+scan_beam(File, What0, AllowMissingChunks, OptionalChunks) 
+  ->
+  case scan_beam1(File, What0) of
+    {missing, _FD, Mod, Data, What} when AllowMissingChunks 
+      ->
+      {ok, Mod, [{Id, missing_chunk} || Id <- What] ++ Data};
+    {missing, FD, Mod, Data, What} 
+      ->
+      case What -- OptionalChunks of
+        [] -> {ok, Mod, Data};
+        [Missing | _] -> error({missing_chunk, filename(FD), Missing})
+      end;
+    R ->
+      R
+  end.
+
+%%------------------------------------------------------------------------------
+
+%% -> {ok, Module, Data} | throw(Error)
+scan_beam1(File, What) ->
+  FD = open_file(File),
+  case catch scan_beam2(FD, What) of
+    Error when error =:= element(1, Error) ->
+      throw(Error);
+    R ->
+      R
+  end.
+
+%%------------------------------------------------------------------------------
+
+scan_beam2(FD, What) ->
+  case pread(FD, 0, 12) of
+    {NFD, {ok, <<"FOR1", _Size:32, "BEAM">>}} ->
+      Start = 12,
+      scan_beam(NFD, Start, What, 17, []);
+    _Error ->
+      error({not_a_beam_file, filename(FD)})
+  end.
+
+
+%%------------------------------------------------------------------------------
+%%% Utils.
+
+-record(bb, { pos = 0 :: integer(),
+  bin :: binary(),
+  source :: binary() | string()}).
+
+%%------------------------------------------------------------------------------
+
+pread(FD, AtPos, Size) ->
+  #bb{pos = Pos, bin = Binary} = FD,
+  Skip = AtPos-Pos,
+  case Binary of
+    <<_:Skip/binary, B:Size/binary, Bin/binary>> 
+      ->
+      NFD = FD#bb{pos = AtPos+Size, bin = Bin},
+      {NFD, {ok, B}};
+    
+    <<_:Skip/binary, Bin/binary>> when byte_size(Bin) > 0 
+      ->
+      NFD = FD#bb{pos = AtPos+byte_size(Bin), bin = <<>>},
+      {NFD, {ok, Bin}};
+    
+    _ ->
+      {FD, eof}
+  end.
+
+%%------------------------------------------------------------------------------
+
+scan_beam(_FD, _Pos, [], Mod, Data) when Mod =/= 17 ->
+  {ok, Mod, Data};
+
+scan_beam(FD, Pos, What, Mod, Data) ->
+  case pread(FD, Pos, 8) of
+    {_NFD, eof} when Mod =:= 17 ->
+      error({missing_chunk, filename(FD), "Atom"});
+    {_NFD, eof} when What =:= info ->
+      {ok, Mod, reverse(Data)};
+    {NFD, eof} ->
+      {missing, NFD, Mod, Data, What};
+    {NFD, {ok, <<IdL:4/binary, Sz:32>>}} ->
+      Id = binary_to_list(IdL),
+      Pos1 = Pos + 8,
+      Pos2 = (4 * trunc((Sz+3) / 4)) + Pos1,
+      get_data(What, Id, NFD, Sz, Pos1, Pos2, Mod, Data);
+    {_NFD, {ok, _ChunkHead}} ->
+      error({invalid_beam_file, filename(FD), Pos})
+  end.
+
+%%------------------------------------------------------------------------------
+
+filename(BB) when is_binary(BB#bb.source) ->
+  BB#bb.source;
+
+filename(BB) ->
+  list_to_atom(BB#bb.source).
+
+%%------------------------------------------------------------------------------
+
+get_data(Cs, "Atom" = Id, FD, Size, Pos, Pos2, _Mod, Data) 
+  ->
+  get_atom_data(Cs, Id, FD, Size, Pos, Pos2, Data, latin1);
+
+get_data(Cs, "AtU8" = Id, FD, Size, Pos, Pos2, _Mod, Data) 
+  ->
+  get_atom_data(Cs, Id, FD, Size, Pos, Pos2, Data, utf8);
+
+get_data(info, Id, FD, Size, Pos, Pos2, Mod, Data) 
+  ->
+  scan_beam(FD, Pos2, info, Mod, [{Id, Pos, Size} | Data]);
+
+get_data(Chunks, Id, FD, Size, Pos, Pos2, Mod, Data) 
+  ->
+  {NFD, NewData} = case member(Id, Chunks) of
+                     true ->
+                       {FD1, Chunk} = get_chunk(Id, Pos, Size, FD),
+                       {FD1, [{Id, Chunk} | Data]};
+                     false ->
+                       {FD, Data}
+                   end,
+  NewChunks = del_chunk(Id, Chunks),
+  scan_beam(NFD, Pos2, NewChunks, Mod, NewData).
+
+%%------------------------------------------------------------------------------
+
+get_atom_data(Cs, Id, FD, Size, Pos, Pos2, Data, Encoding) 
+  ->
+  NewCs = del_chunk(Id, Cs),
+  
+  {NFD, Chunk} = get_chunk(Id, Pos, Size, FD),
+  
+  <<_Num:32, Chunk2/binary>> = Chunk,
+  
+  {Module, _} = extract_atom(Chunk2, Encoding),
+  
+  C = case Cs of
+        info ->
+          {Id, Pos, Size};
+        _ ->
+          {Id, Chunk}
+      end,
+  scan_beam(NFD, Pos2, NewCs, Module, [C | Data]).
+
+%%------------------------------------------------------------------------------
+
+del_chunk(_Id, info) ->
+  info;
+del_chunk(Id, Chunks) ->
+  delete(Id, Chunks).
+
+%%------------------------------------------------------------------------------
+%% delete(Item, List) -> List'
+%% Delete the first occurrence of Item from the list L.
+
+-spec delete(Elem, List1) -> List2 when
+  Elem :: T,
+  List1 :: [T],
+  List2 :: [T],
+  T :: term().
+
+delete(Item, [Item|Rest]) -> Rest;
+
+delete(Item, [H|Rest]) ->  [H|delete(Item, Rest)];
+
+delete(_, []) -> [].
+
+%%------------------------------------------------------------------------------
+%% -> {NFD, binary()} | throw(Error)
+get_chunk(Id, Pos, Size, FD) ->
+  case pread(FD, Pos, Size) of
+    {NFD, eof} when Size =:= 0 -> % cannot happen
+      {NFD, <<>>};
+    
+    {_NFD, eof} when Size > 0 ->
+      error({chunk_too_big, filename(FD), Id, Size, 0});
+    
+    {_NFD, {ok, Chunk}} when Size > byte_size(Chunk) ->
+      error({chunk_too_big, filename(FD), Id, Size, byte_size(Chunk)});
+    
+    {NFD, {ok, Chunk}} -> % when Size =:= size(Chunk)
+      {NFD, Chunk}
+  end.
+
+%%------------------------------------------------------------------------------
+
+extract_atom(<<Len, B/binary>>, Encoding) ->
+  <<SB:Len/binary, Tail/binary>> = B,
+  {binary_to_atom(SB, Encoding), Tail}.
+
+%%------------------------------------------------------------------------------
+
+open_file(<<"FOR1",_/binary>>=Binary) ->
+  #bb{bin = Binary, source = Binary};
+
+open_file(Binary0) when is_binary(Binary0) ->
+  Binary = uncompress(Binary0),
+  #bb{bin = Binary, source = Binary};
+
+open_file(FileName) ->
+  case file:open(FileName, [read, raw, binary]) of
+    {ok, Fd} ->
+      read_all(Fd, FileName, []);
+    Error ->
+      file_error(FileName, Error)
+  end.
+
+%%------------------------------------------------------------------------------
+
+uncompress(Binary0) ->
+  {ok, Fd} = ram_file:open(Binary0, [write, binary]),
+  {ok, _} = ram_file:uncompress(Fd),
+  {ok, Binary} = ram_file:get_file(Fd),
+  ok = ram_file:close(Fd),
+  Binary.
+
+%%------------------------------------------------------------------------------
+
+read_all(Fd, FileName, Bins) ->
+  case file:read(Fd, 1 bsl 18) of
+    {ok, Bin} ->
+      read_all(Fd, FileName, [Bin | Bins]);
+    eof ->
+      ok = file:close(Fd),
+      #bb{bin = uncompress(reverse(Bins)), source = FileName};
+    Error ->
+      ok = file:close(Fd),
+      file_error(FileName, Error)
+  end.
+
+%%------------------------------------------------------------------------------
+%% reverse(L) reverse all elements in the list L. reverse/2 is now a BIF!
+
+-spec reverse(List1) -> List2 when
+  List1 :: [T],
+  List2 :: [T],
+  T :: term().
+
+reverse([] = L) ->
+  L;
+reverse([_] = L) ->
+  L;
+reverse([A, B]) ->
+  [B, A];
+reverse([A, B | L]) ->
+  lists:reverse(L, [B, A]).
+
+%%------------------------------------------------------------------------------
+-spec file_error(file:filename(), {'error',atom()}) -> no_return().
+
+file_error(FileName, {error, Reason}) ->
+  error({file_error, FileName, Reason}).
+
+%%------------------------------------------------------------------------------
+
+error(Reason) ->
+  throw({error, ?MODULE, Reason}).
+
+%%------------------------------------------------------------------------------
+
+%% Shadowed by erl_bif_types: lists:member/2
+-spec member(Elem, List) -> boolean() when
+  Elem :: T,
+  List :: [T],
+  T :: term().
+
+member(_, _) ->
+  erlang:nif_error(undef).
