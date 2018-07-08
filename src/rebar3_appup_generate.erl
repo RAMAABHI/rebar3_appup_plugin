@@ -153,8 +153,7 @@ do(State) ->
                                                    State),
     FileContent=[{added,AddApps0},{upgrade,UpgradeApps0},{remove,RemoveApps}],
     {ok,Cwd} = file:get_cwd(), 
-    {ok,IoDev} = file:open(Cwd ++ "/" ++ "rebar3_apps_changed",[write]),
-    file:write(IoDev,FileContent), 
+    file:write(Cwd ++ "/" ++ "rebar3_apps_changed",FileContent), 
     %% Get a list of any appup files that exist in the current release
     CurrentAppUpFiles = rebar3_appup_utils:find_files_by_ext(
                             filename:join([CurrentRelPath, "lib"]),
